@@ -698,8 +698,15 @@ def main():
         
         print("🔐 Initializing QuickBooks authentication...")
         
+        # Check if manual re-authorization is required
+        if auth_manager.requires_manual_reauth():
+            print(auth_manager.get_reauth_instructions())
+            return 1
+        
         if not auth_manager.validate_connection():
             print("❌ QuickBooks authentication failed - check credentials")
+            if auth_manager.requires_manual_reauth():
+                print(auth_manager.get_reauth_instructions())
             return 1
         
         print("✅ QuickBooks authentication validated")

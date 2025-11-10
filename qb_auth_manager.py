@@ -57,6 +57,7 @@ class QuickBooksAuthManager:
     def refresh_access_token(self) -> bool:
         """
         Refresh the access token using the refresh token.
+        Handles expired access tokens, expired refresh tokens, invalid grants, and CSRF errors.
         
         Returns:
             bool: True if refresh was successful, False otherwise
@@ -98,12 +99,56 @@ class QuickBooksAuthManager:
                 print("✅ Token refreshed successfully")
                 return True
             else:
-                print(f"❌ Token refresh failed: {response.status_code}")
-                print(f"   Response: {response.text}")
-                return False
+                # Handle specific QuickBooks certification scenarios
+                error_data = {}
+                try:
+                    error_data = response.json()
+                except:
+                    pass
                 
+                error_type = error_data.get('error', 'unknown_error')
+                error_description = error_data.get('error_description', response.text)
+                
+                if response.status_code == 400:
+                    if error_type == 'invalid_grant':
+                        print("❌ INVALID GRANT ERROR: Refresh token is expired or invalid")
+                        print("   → Manual re-authorization required through QuickBooks OAuth flow")
+                        print("   → This typically happens after 101 days of inactivity")
+                        # Clear invalid tokens to prevent retry loops
+                        self.credentials['INTUIT_REFRESH_TOKEN'] = 'EXPIRED'
+                        self._save_credentials()
+                        return False
+                    elif 'expired' in error_description.lower():
+                        print("❌ EXPIRED REFRESH TOKEN: Refresh token has expired")
+                        print("   → Manual re-authorization required")
+                        return False
+                elif response.status_code == 401:
+                    print("❌ UNAUTHORIZED: Invalid client credentials or token")
+                    return False
+                elif response.status_code == 403:
+                    print("❌ CSRF ERROR: Cross-Site Request Forgery protection triggered")
+                    print("   → Check request headers and origin")
+                    return False
+                elif response.status_code >= 500:
+                    print(f"❌ SERVER ERROR ({response.status_code}): QuickBooks service issue")
+                    print("   → Temporary issue, retry may succeed")
+                    return False
+                else:
+                    print(f"❌ Token refresh failed: {response.status_code}")
+                    print(f"   Error: {error_type}")
+                    print(f"   Description: {error_description}")
+                    return False
+                
+        except requests.exceptions.Timeout:
+            print("❌ TIMEOUT ERROR: Request to QuickBooks took too long")
+            print("   → Network issue, retry may succeed")
+            return False
+        except requests.exceptions.ConnectionError:
+            print("❌ CONNECTION ERROR: Unable to connect to QuickBooks")
+            print("   → Check internet connection")
+            return False
         except Exception as e:
-            print(f"❌ Exception during token refresh: {e}")
+            print(f"❌ UNEXPECTED ERROR during token refresh: {e}")
             return False
     
     def _get_basic_auth(self, client_id: str, client_secret: str) -> str:
@@ -139,6 +184,7 @@ class QuickBooksAuthManager:
     def make_authenticated_request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
         """
         Make an authenticated request with automatic retry on auth failures.
+        Handles expired access tokens, invalid grants, and CSRF errors.
         
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -164,24 +210,57 @@ class QuickBooksAuthManager:
             kwargs['headers'] = headers
             
             try:
+                # Set timeout to handle hanging requests
+                if 'timeout' not in kwargs:
+                    kwargs['timeout'] = 30
+                
                 response = requests.request(method, url, **kwargs)
                 
-                # If we get 401, the token might be expired - try refresh on next attempt
-                if response.status_code == 401 and attempt < max_retries:
-                    print(f"🔄 Got 401, attempting token refresh (attempt {attempt + 1})")
-                    # Force refresh by clearing timestamp
-                    self.credentials['TOKEN_TIMESTAMP'] = '2020-01-01T00:00:00'
-                    continue
+                # Handle QuickBooks certification error scenarios
+                if response.status_code == 401:
+                    if attempt < max_retries:
+                        print(f"🔄 EXPIRED ACCESS TOKEN: Attempting refresh (attempt {attempt + 1})")
+                        # Force refresh by clearing timestamp
+                        self.credentials['TOKEN_TIMESTAMP'] = '2020-01-01T00:00:00'
+                        continue
+                    else:
+                        print("❌ PERSISTENT 401 ERROR: Access token refresh failed")
+                        print("   → Manual re-authorization may be required")
+                
+                elif response.status_code == 403:
+                    print("❌ CSRF ERROR: Cross-Site Request Forgery protection triggered")
+                    print("   → Check request headers, user agent, and referrer")
+                    return response  # Don't retry CSRF errors
+                
+                elif response.status_code >= 500:
+                    if attempt < max_retries:
+                        print(f"🔄 SERVER ERROR ({response.status_code}): Retrying... (attempt {attempt + 1})")
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                    else:
+                        print(f"❌ PERSISTENT SERVER ERROR ({response.status_code}): QuickBooks service issue")
                 
                 return response
                 
-            except Exception as e:
-                print(f"❌ Request exception (attempt {attempt + 1}): {e}")
+            except requests.exceptions.Timeout:
+                print(f"❌ TIMEOUT ERROR: Request took too long (attempt {attempt + 1})")
                 if attempt < max_retries:
-                    time.sleep(1)  # Brief delay before retry
+                    time.sleep(1)
                     continue
-                return None
+                    
+            except requests.exceptions.ConnectionError:
+                print(f"❌ CONNECTION ERROR: Unable to connect to QuickBooks (attempt {attempt + 1})")
+                if attempt < max_retries:
+                    time.sleep(2)
+                    continue
+                    
+            except Exception as e:
+                print(f"❌ REQUEST EXCEPTION (attempt {attempt + 1}): {e}")
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue
         
+        print("❌ All request attempts failed")
         return None
     
     def validate_connection(self) -> bool:
@@ -217,6 +296,62 @@ class QuickBooksAuthManager:
         else:
             self.base_url = "https://sandbox-quickbooks.api.intuit.com"
             print("🧪 Switched to sandbox environment")
+    
+    def requires_manual_reauth(self) -> bool:
+        """
+        Check if manual re-authorization is required.
+        This happens when refresh tokens are expired or invalid.
+        
+        Returns:
+            bool: True if OAuth playground re-authorization is needed
+        """
+        refresh_token = self.credentials.get('INTUIT_REFRESH_TOKEN', '')
+        
+        # Check for obvious invalid states
+        if not refresh_token or refresh_token == 'EXPIRED':
+            return True
+        
+        # Try a test refresh to see if token is valid
+        if self._is_token_expired():
+            print("🔍 Testing refresh token validity...")
+            if not self.refresh_access_token():
+                return True
+        
+        return False
+    
+    def get_reauth_instructions(self) -> str:
+        """
+        Get instructions for manual re-authorization.
+        
+        Returns:
+            str: Formatted instructions for re-authorization
+        """
+        client_id = self.credentials.get('INTUIT_CLIENT_ID', 'YOUR_CLIENT_ID')
+        is_production = 'quickbooks.api.intuit.com' in self.base_url
+        
+        environment = "Production" if is_production else "Sandbox"
+        oauth_url = "https://developer.intuit.com/app/developer/oauth2playground"
+        
+        instructions = f"""
+🔑 MANUAL RE-AUTHORIZATION REQUIRED
+
+Your QuickBooks tokens have expired and need to be refreshed manually.
+
+📋 STEPS TO RE-AUTHORIZE:
+1. Visit the OAuth 2.0 Playground: {oauth_url}
+2. Select "{environment}" environment
+3. Enter your Client ID: {client_id}
+4. Click "Connect to QuickBooks"
+5. Authorize your application
+6. Copy the new Access Token and Refresh Token
+7. Update your credentials.config file
+8. Add current timestamp: TOKEN_TIMESTAMP={datetime.now().isoformat()}
+
+⚠️  NOTE: This typically happens after 101 days of inactivity.
+💡 TIP: Set up a monthly reminder to run your automation to keep tokens fresh.
+        """
+        
+        return instructions
 
 
 def example_usage():
