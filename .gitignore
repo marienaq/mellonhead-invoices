@@ -1,6 +1,8 @@
 # QuickBooks credentials - NEVER commit these!
 config.json
 credentials.config
+credentials.*.config
+*.credentials
 
 # QuickBooks data exports (may contain sensitive info)
 qb_data_*.json

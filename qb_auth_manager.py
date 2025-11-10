@@ -9,19 +9,42 @@ import requests
 import json
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 from qb_error_handler import QuickBooksErrorHandler
 
 
 class QuickBooksAuthManager:
     """Manages QuickBooks OAuth tokens with automatic refresh and retry logic."""
     
-    def __init__(self, credentials_file: str = "credentials.config"):
-        self.credentials_file = credentials_file
+    def __init__(self, environment: str = "sandbox", credentials_file: str = None):
+        """
+        Initialize QuickBooks Auth Manager.
+        
+        Args:
+            environment: "sandbox" or "production" 
+            credentials_file: Custom path to credentials file (overrides environment)
+        """
+        self.environment = environment.lower()
+        
+        # Set credentials file based on environment if not specified
+        if credentials_file:
+            self.credentials_file = credentials_file
+        else:
+            if self.environment == "production":
+                self.credentials_file = "credentials.production.config"
+            else:
+                self.credentials_file = "credentials.sandbox.config"
+        
         self.credentials = self._load_credentials()
-        self.base_url = "https://sandbox-quickbooks.api.intuit.com"  # Will be configurable
+        
+        # Set base URL based on environment
+        if self.environment == "production":
+            self.base_url = "https://quickbooks.api.intuit.com"
+        else:
+            self.base_url = "https://sandbox-quickbooks.api.intuit.com"
+            
         self.token_endpoint = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-        self.error_handler = QuickBooksErrorHandler()
+        self.error_handler = QuickBooksErrorHandler(f"qb_api_{self.environment}.log")
         
     def _load_credentials(self) -> Dict[str, str]:
         """Load credentials from config file."""
@@ -296,12 +319,15 @@ class QuickBooksAuthManager:
             return False
     
     def set_production_mode(self, production: bool = True):
-        """Switch between sandbox and production environments."""
+        """Switch between sandbox and production environments (deprecated - use constructor)."""
+        print("⚠️  WARNING: set_production_mode() is deprecated. Use environment parameter in constructor.")
         if production:
             self.base_url = "https://quickbooks.api.intuit.com"
+            self.environment = "production"
             print("🚀 Switched to production environment")
         else:
-            self.base_url = "https://sandbox-quickbooks.api.intuit.com"
+            self.base_url = "https://sandbox-quickbooks.api.intuit.com" 
+            self.environment = "sandbox"
             print("🧪 Switched to sandbox environment")
     
     def requires_manual_reauth(self) -> bool:
@@ -336,7 +362,7 @@ class QuickBooksAuthManager:
         client_id = self.credentials.get('INTUIT_CLIENT_ID', 'YOUR_CLIENT_ID')
         is_production = 'quickbooks.api.intuit.com' in self.base_url
         
-        environment = "Production" if is_production else "Sandbox"
+        environment = self.environment.title()
         oauth_url = "https://developer.intuit.com/app/developer/oauth2playground"
         
         instructions = f"""
@@ -372,8 +398,11 @@ Your QuickBooks tokens have expired and need to be refreshed manually.
 def example_usage():
     """Example of how to use the auth manager."""
     try:
-        # Initialize auth manager
-        auth = QuickBooksAuthManager()
+        # Initialize auth manager (sandbox by default)
+        auth = QuickBooksAuthManager(environment="sandbox")
+        
+        print(f"🔧 Testing {auth.environment} environment")
+        print(f"📁 Using credentials: {auth.credentials_file}")
         
         # Test connection
         if not auth.validate_connection():

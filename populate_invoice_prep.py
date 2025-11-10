@@ -691,12 +691,10 @@ def main():
     
     # Initialize QuickBooks authentication manager
     try:
-        auth_manager = QuickBooksAuthManager()
+        environment = "production" if dates['production'] else "sandbox"
+        auth_manager = QuickBooksAuthManager(environment=environment)
         
-        # Set production or sandbox mode
-        auth_manager.set_production_mode(dates['production'])
-        
-        print("🔐 Initializing QuickBooks authentication...")
+        print(f"🔐 Initializing QuickBooks authentication ({environment})...")
         
         # Check if manual re-authorization is required
         if auth_manager.requires_manual_reauth():
