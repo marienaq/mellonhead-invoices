@@ -10,6 +10,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
+from qb_error_handler import QuickBooksErrorHandler
 
 
 class QuickBooksAuthManager:
@@ -20,6 +21,7 @@ class QuickBooksAuthManager:
         self.credentials = self._load_credentials()
         self.base_url = "https://sandbox-quickbooks.api.intuit.com"  # Will be configurable
         self.token_endpoint = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+        self.error_handler = QuickBooksErrorHandler()
         
     def _load_credentials(self) -> Dict[str, str]:
         """Load credentials from config file."""
@@ -83,7 +85,14 @@ class QuickBooksAuthManager:
         
         try:
             print("🔄 Refreshing QuickBooks access token...")
+            
+            # Log the request
+            self.error_handler.log_api_request('POST', self.token_endpoint, headers, data)
+            
             response = requests.post(self.token_endpoint, headers=headers, data=data)
+            
+            # Log the response
+            response_data = self.error_handler.log_api_response(response)
             
             if response.status_code == 200:
                 token_data = response.json()
@@ -99,44 +108,30 @@ class QuickBooksAuthManager:
                 print("✅ Token refreshed successfully")
                 return True
             else:
-                # Handle specific QuickBooks certification scenarios
-                error_data = {}
-                try:
-                    error_data = response.json()
-                except:
-                    pass
+                # Handle errors using the error handler
+                error_info = self.error_handler.handle_api_error(response)
                 
-                error_type = error_data.get('error', 'unknown_error')
-                error_description = error_data.get('error_description', response.text)
+                error_type = error_info.get('error_type', 'unknown_error')
+                error_message = error_info.get('error_message', response.text)
                 
-                if response.status_code == 400:
-                    if error_type == 'invalid_grant':
-                        print("❌ INVALID GRANT ERROR: Refresh token is expired or invalid")
-                        print("   → Manual re-authorization required through QuickBooks OAuth flow")
-                        print("   → This typically happens after 101 days of inactivity")
-                        # Clear invalid tokens to prevent retry loops
-                        self.credentials['INTUIT_REFRESH_TOKEN'] = 'EXPIRED'
-                        self._save_credentials()
-                        return False
-                    elif 'expired' in error_description.lower():
-                        print("❌ EXPIRED REFRESH TOKEN: Refresh token has expired")
-                        print("   → Manual re-authorization required")
-                        return False
-                elif response.status_code == 401:
-                    print("❌ UNAUTHORIZED: Invalid client credentials or token")
-                    return False
-                elif response.status_code == 403:
-                    print("❌ CSRF ERROR: Cross-Site Request Forgery protection triggered")
-                    print("   → Check request headers and origin")
-                    return False
-                elif response.status_code >= 500:
-                    print(f"❌ SERVER ERROR ({response.status_code}): QuickBooks service issue")
-                    print("   → Temporary issue, retry may succeed")
+                # Handle specific error types
+                if 'invalid_grant' in error_type or 'authentication_error' in error_type:
+                    print(f"❌ {error_message}")
+                    print("   → Manual re-authorization required through QuickBooks OAuth flow")
+                    if error_info.get('intuit_tid'):
+                        print(f"   → Reference ID for support: {error_info['intuit_tid']}")
+                    # Clear invalid tokens to prevent retry loops
+                    self.credentials['INTUIT_REFRESH_TOKEN'] = 'EXPIRED'
+                    self._save_credentials()
                     return False
                 else:
-                    print(f"❌ Token refresh failed: {response.status_code}")
-                    print(f"   Error: {error_type}")
-                    print(f"   Description: {error_description}")
+                    print(f"❌ {error_message}")
+                    if error_info.get('troubleshooting_steps'):
+                        print("   Troubleshooting steps:")
+                        for step in error_info['troubleshooting_steps'][:3]:  # Show first 3 steps
+                            print(f"     • {step}")
+                    if error_info.get('intuit_tid'):
+                        print(f"   → Reference ID for support: {error_info['intuit_tid']}")
                     return False
                 
         except requests.exceptions.Timeout:
@@ -214,31 +209,43 @@ class QuickBooksAuthManager:
                 if 'timeout' not in kwargs:
                     kwargs['timeout'] = 30
                 
+                # Log the request
+                self.error_handler.log_api_request(method, url, headers, kwargs.get('json'), kwargs.get('params'))
+                
                 response = requests.request(method, url, **kwargs)
                 
-                # Handle QuickBooks certification error scenarios
-                if response.status_code == 401:
-                    if attempt < max_retries:
+                # Log the response
+                response_data = self.error_handler.log_api_response(response)
+                
+                # Handle errors using comprehensive error handler
+                if response.status_code >= 400:
+                    error_info = self.error_handler.handle_api_error(response)
+                    
+                    if response.status_code == 401 and attempt < max_retries:
                         print(f"🔄 EXPIRED ACCESS TOKEN: Attempting refresh (attempt {attempt + 1})")
                         # Force refresh by clearing timestamp
                         self.credentials['TOKEN_TIMESTAMP'] = '2020-01-01T00:00:00'
                         continue
-                    else:
-                        print("❌ PERSISTENT 401 ERROR: Access token refresh failed")
-                        print("   → Manual re-authorization may be required")
-                
-                elif response.status_code == 403:
-                    print("❌ CSRF ERROR: Cross-Site Request Forgery protection triggered")
-                    print("   → Check request headers, user agent, and referrer")
-                    return response  # Don't retry CSRF errors
-                
-                elif response.status_code >= 500:
-                    if attempt < max_retries:
-                        print(f"🔄 SERVER ERROR ({response.status_code}): Retrying... (attempt {attempt + 1})")
+                    elif response.status_code == 403:
+                        print(f"❌ {error_info['error_message']}")
+                        if error_info.get('intuit_tid'):
+                            print(f"   → Reference ID: {error_info['intuit_tid']}")
+                        return response  # Don't retry CSRF errors
+                    elif response.status_code >= 500 and attempt < max_retries:
+                        print(f"🔄 SERVER ERROR: Retrying... (attempt {attempt + 1})")
                         time.sleep(2 ** attempt)  # Exponential backoff
                         continue
+                    elif response.status_code == 429 and attempt < max_retries:
+                        retry_after = error_info.get('retry_after_seconds', 60)
+                        print(f"🔄 RATE LIMITED: Waiting {retry_after}s before retry (attempt {attempt + 1})")
+                        time.sleep(retry_after)
+                        continue
                     else:
-                        print(f"❌ PERSISTENT SERVER ERROR ({response.status_code}): QuickBooks service issue")
+                        print(f"❌ {error_info['error_message']}")
+                        if error_info.get('intuit_tid'):
+                            print(f"   → Reference ID for support: {error_info['intuit_tid']}")
+                        if not error_info.get('retry_recommended') and response.status_code != 401:
+                            return response  # Don't retry non-retryable errors
                 
                 return response
                 
@@ -352,6 +359,14 @@ Your QuickBooks tokens have expired and need to be refreshed manually.
         """
         
         return instructions
+    
+    def get_support_info(self) -> str:
+        """Get support contact information and error details."""
+        return self.error_handler.get_support_info()
+    
+    def get_error_summary(self) -> Dict[str, Any]:
+        """Get summary of API errors encountered."""
+        return self.error_handler.get_error_summary()
 
 
 def example_usage():

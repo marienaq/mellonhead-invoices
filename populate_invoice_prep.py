@@ -787,6 +787,9 @@ def main():
             print("   2. Implement real Notion API calls to create prep records")
             print("   3. Set up n8n automation for monthly execution")
     else:
+        print("\\n❌ Some invoices failed to create.")
+        print("\\n🆘 SUPPORT INFORMATION:")
+        print(auth_manager.get_support_info())
         return 1
         
     return 0
