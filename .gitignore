@@ -1,0 +1,29 @@
+# QuickBooks credentials - NEVER commit these!
+config.json
+credentials.config
+
+# QuickBooks data exports (may contain sensitive info)
+qb_data_*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
