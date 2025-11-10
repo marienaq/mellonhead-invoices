@@ -9,6 +9,7 @@ import requests
 import json
 import argparse
 from datetime import datetime, timedelta
+from qb_auth_manager import QuickBooksAuthManager
 
 
 def load_credentials():
@@ -494,43 +495,30 @@ def group_by_client_for_invoicing(prep_data):
     return client_invoices
 
 
-def fetch_qb_service_price(service_id):
+def fetch_qb_service_price(service_id, auth_manager):
     """Fetch service price from QuickBooks API."""
-    creds = load_credentials()
-    access_token = creds.get('INTUIT_ACCESS_TOKEN')
-    realm_id = creds.get('INTUIT_REALM_ID')
-    
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Accept': 'application/json'
-    }
-    
-    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/item/{service_id}"
+    realm_id = auth_manager.credentials.get('INTUIT_REALM_ID')
+    url = f"{auth_manager.base_url}/v3/company/{realm_id}/item/{service_id}"
     
     try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        
-        data = response.json()
-        item = data.get('Item', {})
-        return item.get('UnitPrice', 0)
+        response = auth_manager.make_authenticated_request('GET', url)
+        if response and response.status_code == 200:
+            data = response.json()
+            item = data.get('Item', {})
+            return item.get('UnitPrice', 0)
+        else:
+            status = response.status_code if response else "No response"
+            print(f"   Warning: Could not fetch price for service {service_id}: HTTP {status}")
+            return 0
         
     except Exception as e:
         print(f"   Warning: Could not fetch price for service {service_id}: {e}")
         return 0
 
 
-def create_qb_invoice_from_prep(client_name, client_data):
+def create_qb_invoice_from_prep(client_name, client_data, auth_manager):
     """Create QuickBooks invoice from Monthly Invoice Prep data."""
-    creds = load_credentials()
-    access_token = creds.get('INTUIT_ACCESS_TOKEN')
-    realm_id = creds.get('INTUIT_REALM_ID')
-    
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-    }
+    realm_id = auth_manager.credentials.get('INTUIT_REALM_ID')
     
     # Convert prep data to QB line items
     line_items = []
@@ -553,7 +541,7 @@ def create_qb_invoice_from_prep(client_name, client_data):
             line_item['SalesItemLineDetail']['UnitPrice'] = item['invoice_amount']
         else:
             # For retainer services, fetch price from QuickBooks
-            service_price = fetch_qb_service_price(qb_item_id)
+            service_price = fetch_qb_service_price(qb_item_id, auth_manager)
             if service_price > 0:
                 line_item['Amount'] = service_price
                 line_item['SalesItemLineDetail']['UnitPrice'] = service_price
@@ -573,7 +561,7 @@ def create_qb_invoice_from_prep(client_name, client_data):
         'CustomerMemo': {'value': 'Payment accepted via ACH or Wire. Contact billing@mellonhead.co for account and routing numbers.'}
     }
     
-    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    url = f"{auth_manager.base_url}/v3/company/{realm_id}/invoice"
     
     try:
         print(f"\\n📧 Creating consolidated invoice for {client_name}...")
@@ -584,9 +572,9 @@ def create_qb_invoice_from_prep(client_name, client_data):
             print(f"     {i}. {item['invoice_description']}: {amount_str}")
         print(f"   Total Amount: ${total_amount}")
         
-        response = requests.post(url, headers=headers, json=invoice_data)
+        response = auth_manager.make_authenticated_request('POST', url, json=invoice_data)
         
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             result = response.json()
             invoice = result['Invoice']
             invoice_id = invoice['Id']
@@ -599,9 +587,11 @@ def create_qb_invoice_from_prep(client_name, client_data):
                 'total_amount': total_amount
             }
         else:
-            print(f"   ❌ Error: {response.status_code}")
-            print(f"   Response: {response.text}")
-            return {'success': False, 'error': response.text}
+            status = response.status_code if response else "No response"
+            error_text = response.text if response else "Connection failed"
+            print(f"   ❌ Error: {status}")
+            print(f"   Response: {error_text}")
+            return {'success': False, 'error': error_text}
             
     except Exception as e:
         print(f"   ❌ Exception: {e}")
@@ -638,6 +628,8 @@ Examples:
                        help='Show what would be created without actually creating QB invoices')
     parser.add_argument('--debug', action='store_true',
                        help='Show detailed breakdown of client data and calculations')
+    parser.add_argument('--production', action='store_true',
+                       help='Use production QuickBooks environment (default: sandbox)')
     
     return parser.parse_args()
 
@@ -671,7 +663,8 @@ def validate_date_inputs(args):
             'bill_month': args.bill_month,
             'invoice_date': invoice_date.strftime('%Y-%m-%d'),
             'dry_run': args.dry_run,
-            'debug': args.debug
+            'debug': args.debug,
+            'production': args.production
         }
         
     except ValueError as e:
@@ -695,6 +688,24 @@ def main():
     print(f"📅 Invoice date: {dates['invoice_date']}")
     if dates['dry_run']:
         print("🔍 DRY RUN MODE - No QuickBooks invoices will be created")
+    
+    # Initialize QuickBooks authentication manager
+    try:
+        auth_manager = QuickBooksAuthManager()
+        
+        # Set production or sandbox mode
+        auth_manager.set_production_mode(dates['production'])
+        
+        print("🔐 Initializing QuickBooks authentication...")
+        
+        if not auth_manager.validate_connection():
+            print("❌ QuickBooks authentication failed - check credentials")
+            return 1
+        
+        print("✅ QuickBooks authentication validated")
+    except Exception as e:
+        print(f"❌ Error initializing QuickBooks authentication: {e}")
+        return 1
     
     # Step 1: Fetch client data and time tracking data from Notion  
     print(f"\\n📊 STEP 1: Fetching data from Notion...")
@@ -732,7 +743,7 @@ def main():
             print(f"   🔍 Would create invoice for {client_name}: ${results[client_name]['total_amount']}")
     else:
         for client_name, client_data in client_invoices.items():
-            result = create_qb_invoice_from_prep(client_name, client_data)
+            result = create_qb_invoice_from_prep(client_name, client_data, auth_manager)
             results[client_name] = result
     
     # Summary
