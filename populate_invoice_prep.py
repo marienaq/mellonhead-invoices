@@ -393,7 +393,8 @@ def create_invoice_prep_records(time_data, overage_month, bill_month, invoice_da
     print(f"   Invoice date: {invoice_date}")
     
     # Data source ID for Monthly Invoice Prep database
-    prep_db_id = "233c1e14-b6c5-4ef2-813b-b144ae67a39b"
+    creds = load_credentials()
+    prep_db_id = creds.get('NOTION_MONTHLY_PREP_DB')
     
     records_to_create = []
     
