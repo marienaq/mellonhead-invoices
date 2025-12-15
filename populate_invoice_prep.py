@@ -516,7 +516,7 @@ def fetch_qb_service_price(service_id, auth_manager):
         return 0
 
 
-def create_qb_invoice_from_prep(client_name, client_data, auth_manager):
+def create_qb_invoice_from_prep(client_name, client_data, auth_manager, invoice_date, due_date):
     """Create QuickBooks invoice from Monthly Invoice Prep data."""
     realm_id = auth_manager.credentials.get('INTUIT_REALM_ID')
     
@@ -553,12 +553,24 @@ def create_qb_invoice_from_prep(client_name, client_data, auth_manager):
     
     total_amount = sum(item.get('Amount', 0) for item in line_items)
     
+    # Generate unique invoice number: YYYY-MM-DDDD format (date + client initial + sequential)
+    import datetime as dt
+    invoice_date_obj = dt.datetime.strptime(invoice_date, '%Y-%m-%d')
+    client_initial = client_name[0].upper()
+    # Use timestamp to ensure uniqueness
+    unique_suffix = str(invoice_date_obj.strftime('%m%d'))
+    custom_invoice_num = f"{invoice_date_obj.year}-{unique_suffix}{client_initial}"
+    
     invoice_data = {
         'CustomerRef': {'value': client_data['client_id']},
-        'TxnDate': '2025-11-09',  # Today's date
-        'DueDate': '2025-12-09',  # 30 days from today
+        'TxnDate': invoice_date,  # Dynamic invoice date
+        'DueDate': due_date,  # 30 days from invoice date
+        'DocNumber': custom_invoice_num,  # Custom unique invoice number
         'Line': line_items,
-        'CustomerMemo': {'value': 'Payment accepted via ACH or Wire. Contact billing@mellonhead.co for account and routing numbers.'}
+        'CustomerMemo': {'value': 'Payment accepted via ACH or Wire. Contact billing@mellonhead.co for account and routing numbers.'},
+        'ShipAddr': None,  # Disable shipping address
+        'ShipDate': None,  # Disable ship date
+        'ShipMethodRef': None  # Disable shipping method
     }
     
     url = f"{auth_manager.base_url}/v3/company/{realm_id}/invoice"
@@ -571,6 +583,7 @@ def create_qb_invoice_from_prep(client_name, client_data, auth_manager):
             amount_str = f"${item['invoice_amount']}" if 'invoice_amount' in item else "QB will set amount"
             print(f"     {i}. {item['invoice_description']}: {amount_str}")
         print(f"   Total Amount: ${total_amount}")
+        print(f"   Custom Invoice Number: {custom_invoice_num}")
         
         response = auth_manager.make_authenticated_request('POST', url, json=invoice_data)
         
@@ -578,8 +591,8 @@ def create_qb_invoice_from_prep(client_name, client_data, auth_manager):
             result = response.json()
             invoice = result['Invoice']
             invoice_id = invoice['Id']
-            invoice_num = invoice['DocNumber']
-            print(f"   ✅ Invoice created: #{invoice_num} (ID: {invoice_id})")
+            invoice_num = invoice.get('DocNumber', custom_invoice_num)  # Use our custom number
+            print(f"   ✅ Invoice created: #{invoice_num} (QB ID: {invoice_id})")
             return {
                 'success': True,
                 'invoice_id': invoice_id,
@@ -689,28 +702,30 @@ def main():
     if dates['dry_run']:
         print("🔍 DRY RUN MODE - No QuickBooks invoices will be created")
     
-    # Initialize QuickBooks authentication manager
-    try:
-        environment = "production" if dates['production'] else "sandbox"
-        auth_manager = QuickBooksAuthManager(environment=environment)
-        
-        print(f"🔐 Initializing QuickBooks authentication ({environment})...")
-        
-        # Check if manual re-authorization is required
-        if auth_manager.requires_manual_reauth():
-            print(auth_manager.get_reauth_instructions())
-            return 1
-        
-        if not auth_manager.validate_connection():
-            print("❌ QuickBooks authentication failed - check credentials")
+    # Initialize QuickBooks authentication manager (skip if dry run)
+    auth_manager = None
+    if not dates['dry_run']:
+        try:
+            environment = "production" if dates['production'] else "sandbox"
+            auth_manager = QuickBooksAuthManager(environment=environment)
+            
+            print(f"🔐 Initializing QuickBooks authentication ({environment})...")
+            
+            # Check if manual re-authorization is required
             if auth_manager.requires_manual_reauth():
                 print(auth_manager.get_reauth_instructions())
+                return 1
+            
+            if not auth_manager.validate_connection():
+                print("❌ QuickBooks authentication failed - check credentials")
+                if auth_manager.requires_manual_reauth():
+                    print(auth_manager.get_reauth_instructions())
+                return 1
+            
+            print("✅ QuickBooks authentication validated")
+        except Exception as e:
+            print(f"❌ Error initializing QuickBooks authentication: {e}")
             return 1
-        
-        print("✅ QuickBooks authentication validated")
-    except Exception as e:
-        print(f"❌ Error initializing QuickBooks authentication: {e}")
-        return 1
     
     # Step 1: Fetch client data and time tracking data from Notion  
     print(f"\\n📊 STEP 1: Fetching data from Notion...")
@@ -739,16 +754,33 @@ def main():
     results = {}
     if dates['dry_run']:
         # Simulate results for dry run
+        import datetime as dt
+        invoice_date_obj = dt.datetime.strptime(dates['invoice_date'], '%Y-%m-%d')
+        
         for client_name in client_invoices.keys():
+            # Generate what the custom invoice number would be
+            client_initial = client_name[0].upper()
+            unique_suffix = str(invoice_date_obj.strftime('%m%d'))
+            custom_invoice_num = f"{invoice_date_obj.year}-{unique_suffix}{client_initial}"
+            
+            total_amount = sum(item.get('invoice_amount', 0) for item in client_invoices[client_name]['line_items'])
             results[client_name] = {
                 'success': True,
-                'invoice_number': 'DRY-RUN',
-                'total_amount': sum(item.get('invoice_amount', 0) for item in client_invoices[client_name]['line_items'])
+                'invoice_number': custom_invoice_num,
+                'total_amount': total_amount
             }
-            print(f"   🔍 Would create invoice for {client_name}: ${results[client_name]['total_amount']}")
+            print(f"   🔍 Would create invoice for {client_name}: #{custom_invoice_num} - ${total_amount}")
+            print(f"       Line items: {len(client_invoices[client_name]['line_items'])}")
+            print(f"       Ship-to field: DISABLED")
     else:
+        # Calculate due date (30 days after invoice date)
+        from datetime import datetime, timedelta
+        invoice_date_obj = datetime.strptime(dates['invoice_date'], '%Y-%m-%d')
+        due_date_obj = invoice_date_obj + timedelta(days=30)
+        due_date = due_date_obj.strftime('%Y-%m-%d')
+        
         for client_name, client_data in client_invoices.items():
-            result = create_qb_invoice_from_prep(client_name, client_data, auth_manager)
+            result = create_qb_invoice_from_prep(client_name, client_data, auth_manager, dates['invoice_date'], due_date)
             results[client_name] = result
     
     # Summary
